@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""
+Personal Bookkeeping CLI
+- Add expense/income
+- Categories
+- Daily/Weekly/Monthly totals
+- Save to specified local folder (JSON). Export CSV on demand.
+- Bonus: list/search, undo last entry, monthly budgets per category, top categories report.
+Usage examples:
+  python personal_bookkeeping.py --data-dir "D:\MoneyData" add --type expense --amount 120 --category 食物 --note 早餐 --date 2025-11-08
+  python personal_bookkeeping.py --data-dir ~/money report --period monthly --date 2025-11-01
+  python personal_bookkeeping.py --data-dir ~/money categories --add 交通
+  python personal_bookkeeping.py --data-dir ~/money export --format csv
+  python personal_bookkeeping.py --data-dir ~/money budget --set 食物 6000 --month 2025-11
+  python personal_bookkeeping.py --data-dir ~/money budget --show --month 2025-11
+  python personal_bookkeeping.py --data-dir ~/money top --period monthly --date 2025-11-01 --limit 5
+
+All dates are ISO format. --date for report is any date within that period (defaults to today).
+"""
+
+from pathlib import Path
+import json
+import csv
+from datetime import datetime, date, timedelta
+import argparse
+from typing import List, Dict, Any, Optional, Tuple
+
+DATE_FMT = "%Y-%m-%d"
+
+def iso_today() -> str:
+    return date.today().isoformat()
+
+def ensure_data_dir(data_dir: Path) -> None:
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+def data_files(data_dir: Path) -> Tuple[Path, Path, Path]:
+    tx_path = data_dir / "transactions.json"
+    meta_path = data_dir / "meta.json"           # categories, budgets
+    csv_path = data_dir / "transactions.csv"
+    return tx_path, meta_path, csv_path
+
+def load_json(path: Path, default):
+    if not path.exists():
+        return default
+    with path.open("r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return default
+
+def save_json(path: Path, obj) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def load_transactions(tx_path: Path) -> List[Dict[str, Any]]:
+    return load_json(tx_path, default=[])
+
+def save_transactions(tx_path: Path, items: List[Dict[str, Any]]) -> None:
+    save_json(tx_path, items)
+
+def load_meta(meta_path: Path) -> Dict[str, Any]:
+    default_meta = {
+        "categories": ["食物", "娛樂", "交通", "服飾", "居家", "醫療", "教育", "其他"],
+        "budgets": {}  # e.g., {"2025-11": {"食物": 6000, "交通": 1200}}
+    }
+    data = load_json(meta_path, default=default_meta)
+    data.setdefault("categories", default_meta["categories"])
+    data.setdefault("budgets", default_meta["budgets"])
+    return data
+
+def save_meta(meta_path: Path, meta: Dict[str, Any]) -> None:
+    save_json(meta_path, meta)
+
+def parse_date(s: Optional[str]) -> date:
+    if not s:
+        return date.today()
+    return datetime.strptime(s, DATE_FMT).date()
+
+def start_of_week(d: date) -> date:
+    return d - timedelta(days=d.weekday())
+
+def end_of_week(d: date) -> date:
+    return start_of_week(d) + timedelta(days=6)
+
+def start_of_month(d: date) -> date:
+    return d.replace(day=1)
+
+def end_of_month(d: date) -> date:
+    if d.month == 12:
+        next_month = d.replace(year=d.year+1, month=1, day=1)
+    else:
+        next_month = d.replace(month=d.month+1, day=1)
+    return next_month - timedelta(days=1)
+
+def in_range(tx_date: date, start: date, end: date) -> bool:
+    return start <= tx_date <= end
+
+def add_transaction(args, tx_path: Path, meta_path: Path) -> None:
+    ttype = args.type.lower()
+    if ttype not in ("expense", "income"):
+        raise SystemExit("--type must be 'expense' or 'income'")
+    amount = float(args.amount)
+    if amount <= 0:
+        raise SystemExit("--amount must be positive")
+    d = parse_date(args.date)
+    entry = {
+        "id": f"{datetime.now().strftime('%Y%m%d%H%M%S%f')}",
+        "date": d.isoformat(),
+        "type": ttype,
+        "amount": round(amount, 2),
+        "category": args.category,
+        "note": args.note or ""
+    }
+    items = load_transactions(tx_path)
+    items.append(entry)
+    save_transactions(tx_path, items)
+
+    meta = load_meta(meta_path)
+    if entry["category"] not in meta["categories"]:
+        meta["categories"].append(entry["category"])
+        save_meta(meta_path, meta)
+
+    print("OK: added transaction:")
+    print(json.dumps(entry, ensure_ascii=False, indent=2))
+
+def list_transactions(args, tx_path: Path) -> None:
+    items = load_transactions(tx_path)
+    items_sorted = sorted(items, key=lambda x: (x["date"], x["id"]), reverse=True)
+    limit = args.limit or 20
+    for i, it in enumerate(items_sorted[:limit], 1):
+        print(f"{i:02d}. {it['date']} [{it['type']}] ${it['amount']} | {it.get('category','')} | {it.get('note','')} | id={it['id']}")
+
+def search_transactions(args, tx_path: Path) -> None:
+    items = load_transactions(tx_path)
+    q = (args.query or "").strip()
+    if not q:
+        print("Please provide --query.")
+        return
+    out = []
+    for it in items:
+        if q in it.get("note","") or q in it.get("category",""):
+            out.append(it)
+    out_sorted = sorted(out, key=lambda x: (x["date"], x["id"]), reverse=True)
+    for i, it in enumerate(out_sorted, 1):
+        print(f"{i:02d}. {it['date']} [{it['type']}] ${it['amount']} | {it.get('category','')} | {it.get('note','')} | id={it['id']}")
+    print(f"Total matched: {len(out_sorted)}")
+
+def remove_transaction(args, tx_path: Path) -> None:
+    items = load_transactions(tx_path)
+    before = len(items)
+    items = [it for it in items if it["id"] != args.id]
+    save_transactions(tx_path, items)
+    print(f"Removed: {before - len(items)}")
+
+def undo_last(args, tx_path: Path) -> None:
+    items = load_transactions(tx_path)
+    if not items:
+        print("No transactions to undo.")
+        return
+    last = max(items, key=lambda x: (x["date"], x["id"]))
+    items = [it for it in items if it["id"] != last["id"]]
+    save_transactions(tx_path, items)
+    print("Undone last transaction:")
+    print(json.dumps(last, ensure_ascii=False, indent=2))
+
+def totals_for_period(items: List[Dict[str, Any]], period: str, anchor_date: date) -> Dict[str, Any]:
+    if period == "daily":
+        start = anchor_date
+        end = anchor_date
+    elif period == "weekly":
+        start = start_of_week(anchor_date)
+        end = end_of_week(anchor_date)
+    elif period == "monthly":
+        start = start_of_month(anchor_date)
+        end = end_of_month(anchor_date)
+    else:
+        raise ValueError("period must be daily|weekly|monthly")
+
+    total_exp = 0.0
+    total_inc = 0.0
+    cat_sum = {}
+
+    for it in items:
+        tx_date = datetime.strptime(it["date"], "%Y-%m-%d").date()
+        if in_range(tx_date, start, end):
+            amt = float(it["amount"])
+            if it["type"] == "expense":
+                total_exp += amt
+                cat = it.get("category", "未分類")
+                cat_sum[cat] = cat_sum.get(cat, 0.0) + amt
+            elif it["type"] == "income":
+                total_inc += amt
+
+    return {
+        "period": period,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "total_expense": round(total_exp, 2),
+        "total_income": round(total_inc, 2),
+        "net": round(total_inc - total_exp, 2),
+        "category_breakdown": {k: round(v, 2) for k, v in sorted(cat_sum.items(), key=lambda x: x[1], reverse=True)}
+    }
+
+def report(args, tx_path: Path) -> None:
+    items = load_transactions(tx_path)
+    anchor = parse_date(args.date)
+    res = totals_for_period(items, args.period, anchor)
+    print(json.dumps(res, ensure_ascii=False, indent=2))
+
+def categories_cmd(args, meta_path: Path) -> None:
+    meta = load_meta(meta_path)
+    if args.add:
+        new_cat = args.add.strip()
+        if new_cat and new_cat not in meta["categories"]:
+            meta["categories"].append(new_cat)
+            save_meta(meta_path, meta)
+            print(f"Added category: {new_cat}")
+        else:
+            print("Category exists or invalid.")
+    else:
+        print("Categories:")
+        for c in meta["categories"]:
+            print(f" - {c}")
+
+def export_cmd(args, tx_path: Path, csv_path: Path) -> None:
+    items = load_transactions(tx_path)
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["id","date","type","amount","category","note"])
+        writer.writeheader()
+        for it in items:
+            writer.writerow({
+                "id": it.get("id",""),
+                "date": it.get("date",""),
+                "type": it.get("type",""),
+                "amount": it.get("amount",""),
+                "category": it.get("category",""),
+                "note": it.get("note",""),
+            })
+    print(f"Exported to CSV: {csv_path}")
+
+def budget_cmd(args, meta_path: Path, tx_path: Path) -> None:
+    meta = load_meta(meta_path)
+    budgets = meta.setdefault("budgets", {})
+    if args.set and args.month:
+        month = args.month
+        cat = args.set[0]
+        amt = float(args.set[1])
+        month_map = budgets.setdefault(month, {})
+        month_map[cat] = amt
+        save_meta(meta_path, meta)
+        print(f"Set budget for {month} {cat} = {amt}")
+    elif args.show:
+        month = args.month or date.today().strftime("%Y-%m")
+        month_map = budgets.get(month, {})
+        print(f"Budgets for {month}:")
+        if not month_map:
+            print("  (no budgets set)")
+        else:
+            for k, v in month_map.items():
+                print(f"  {k}: {v}")
+        items = load_transactions(tx_path)
+        start = datetime.strptime(month + "-01", "%Y-%m-%d").date()
+        end = end_of_month(start)
+        spend_by_cat = {}
+        for it in items:
+            if it["type"] != "expense":
+                continue
+            txd = datetime.strptime(it["date"], "%Y-%m-%d").date()
+            if start <= txd <= end:
+                cat = it.get("category","未分類")
+                spend_by_cat[cat] = spend_by_cat.get(cat, 0.0) + float(it["amount"])
+        print("Spend vs Budget:")
+        for k, budget_amt in month_map.items():
+            spent = round(spend_by_cat.get(k, 0.0), 2)
+            remain = round(budget_amt - spent, 2)
+            status = "OK"
+            if remain < 0:
+                status = "OVER"
+            elif remain < budget_amt * 0.1:
+                status = "NEAR"
+            print(f"  {k}: spent {spent} / budget {budget_amt} -> remain {remain} [{status}]")
+    else:
+        print("Use --set CATEGORY AMOUNT --month YYYY-MM or --show [--month YYYY-MM]")
+
+def top_cmd(args, tx_path: Path) -> None:
+    items = load_transactions(tx_path)
+    anchor = parse_date(args.date)
+    res = totals_for_period(items, args.period, anchor)
+    brk = res["category_breakdown"]
+    limit = args.limit or 5
+    print(f"Top {limit} categories for {res['period']} {res['start']}~{res['end']}:")
+    for i, (k, v) in enumerate(list(brk.items())[:limit], 1):
+        print(f"{i}. {k}: {v}")
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="personal_bookkeeping", description="Simple personal bookkeeping CLI")
+    p.add_argument("--data-dir", required=True, help="Folder to store data files (will be created if not exists)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    ap = sub.add_parser("add", help="Add a transaction")
+    ap.add_argument("--type", required=True, choices=["expense","income"], help="Type of transaction")
+    ap.add_argument("--amount", required=True, type=float, help="Amount (positive number)")
+    ap.add_argument("--category", required=True, help="Category label, e.g., 食物/娛樂/交通")
+    ap.add_argument("--note", default="", help="Optional note")
+    ap.add_argument("--date", default=None, help="YYYY-MM-DD (default: today)")
+    ap.set_defaults(func="add")
+
+    lp = sub.add_parser("list", help="List recent transactions")
+    lp.add_argument("--limit", type=int, default=20, help="Number of rows (default 20)")
+    lp.set_defaults(func="list")
+
+    sp = sub.add_parser("search", help="Search transactions by keyword (in category or note)")
+    sp.add_argument("--query", required=True, help="Keyword to search")
+    sp.set_defaults(func="search")
+
+    rp = sub.add_parser("remove", help="Remove a transaction by id")
+    rp.add_argument("--id", required=True, help="Transaction id")
+    rp.set_defaults(func="remove")
+
+    up = sub.add_parser("undo", help="Undo the most recent transaction")
+    up.set_defaults(func="undo")
+
+    rpp = sub.add_parser("report", help="Show totals for a period")
+    rpp.add_argument("--period", required=True, choices=["daily","weekly","monthly"], help="Aggregation period")
+    rpp.add_argument("--date", default=None, help="Any date inside the desired period (default: today)")
+    rpp.set_defaults(func="report")
+
+    cp = sub.add_parser("categories", help="List or add categories")
+    cp.add_argument("--add", help="Add a new category name")
+    cp.set_defaults(func="categories")
+
+    ep = sub.add_parser("export", help="Export all transactions to CSV")
+    ep.add_argument("--format", choices=["csv"], default="csv")
+    ep.set_defaults(func="export")
+
+    bp = sub.add_parser("budget", help="Set or show monthly budgets per category")
+    bp.add_argument("--set", nargs=2, metavar=("CATEGORY","AMOUNT"), help="Set budget for a category")
+    bp.add_argument("--month", help="YYYY-MM month to affect/show (default: current month)")
+    bp.add_argument("--show", action="store_true", help="Show budgets and current spend")
+    bp.set_defaults(func="budget")
+
+    tp = sub.add_parser("top", help="Show top categories by expense within a period")
+    tp.add_argument("--period", required=True, choices=["daily","weekly","monthly"])
+    tp.add_argument("--date", default=None, help="Any date inside the desired period (default: today)")
+    tp.add_argument("--limit", type=int, default=5)
+    tp.set_defaults(func="top")
+
+    return p
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    data_dir = Path(args.data_dir).expanduser().resolve()
+    ensure_data_dir(data_dir)
+    tx_path, meta_path, csv_path = data_files(data_dir)
+
+    if args.cmd == "add":
+        add_transaction(args, tx_path, meta_path)
+    elif args.cmd == "list":
+        list_transactions(args, tx_path)
+    elif args.cmd == "search":
+        search_transactions(args, tx_path)
+    elif args.cmd == "remove":
+        remove_transaction(args, tx_path)
+    elif args.cmd == "undo":
+        undo_last(args, tx_path)
+    elif args.cmd == "report":
+        report(args, tx_path)
+    elif args.cmd == "categories":
+        categories_cmd(args, meta_path)
+    elif args.cmd == "export":
+        export_cmd(args, tx_path, csv_path)
+    elif args.cmd == "budget":
+        budget_cmd(args, meta_path, tx_path)
+    elif args.cmd == "top":
+        top_cmd(args, tx_path)
+    else:
+        parser.print_help()
+
+if __name__ == "__main__":
+    main()
